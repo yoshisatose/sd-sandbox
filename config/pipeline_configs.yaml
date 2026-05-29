@@ -61,7 +61,7 @@ pipelines:
       - "amd/sd-turbo-amdnpu"
     extra_args:
       - "--num_inference_steps"
-      - "1"
+      - "20"
       - "--guidance_scale"
       - "0.0"
 
@@ -93,7 +93,7 @@ pipelines:
       - "amd/sdxl-turbo-amdnpu"
     extra_args:
       - "--num_inference_steps"
-      - "1"
+      - "30"
       - "--guidance_scale"
       - "0.0"
 
@@ -119,18 +119,18 @@ pipelines:
     name: "SD3 Pipeline"
     script: "run_sd3.py"
     model_ids:
-      - "amd/stable-diffusion-3-medium-amdnpu"
+      - "stabilityai/stable-diffusion-3-medium-amdnpu"
     extra_args:
       - "--num_inference_steps"
-      - "8"
+      - "28"
       - "--width"
       - "1024"
       - "--height"
-      - "768"
+      - "1024"
       - "--controlnet"
       - "None"
       - "--guidance_scale"
-      - "4.5"
+      - "5"
       - "--dynamic_shape"
 
   sd3_controlnet_canny:
@@ -258,10 +258,10 @@ pipelines:
     name: "SD3.5 Pipeline"
     script: "run_sd3.py"
     model_ids:
-      - "amd/stable-diffusion-3.5-medium-amdnpu"
+      - "stabilityai/stable-diffusion-3.5-medium-amdnpu"
     extra_args:
       - "--num_inference_steps"
-      - "8"
+      - "40"
       - "--width"
       - "1024"
       - "--height"
@@ -269,16 +269,17 @@ pipelines:
       - "--controlnet"
       - "None"
       - "--guidance_scale"
-      - "4.5"
+      - "5"
+      - "--dynamic_shape"
 
   sd35_base_dyn:    
       name: "SD3.5 Dynamic Pipeline"
       script: "run_sd3.py"
       model_ids:
-        - "amd/stable-diffusion-3.5-medium-amdnpu"
+        - "stabilityai/stable-diffusion-3.5-medium-amdnpu"
       extra_args:
         - "--num_inference_steps"
-        - "8"
+        - "40"
         - "--controlnet"
         - "None"
         - "--dynamic_shape"

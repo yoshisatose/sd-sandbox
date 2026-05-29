@@ -193,9 +193,11 @@ def generate_filename(
         # -> "sd3_img0_canny_profiling_1024x1024_steps8_prompt0_20250108_120000.png"
     """
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    parts = [timestamp]
     
     model_name = model_id.split('/')[-1]
-    parts = [model_name]
+    # Add timestamp
+    parts.append(model_name)
 
     if image_idx is not None:
         parts.append(f"img{image_idx}")
@@ -221,9 +223,6 @@ def generate_filename(
     # Add batch size if provided
     if batch_size is not None:
         parts.append(f"bs{batch_size}")
-    
-    # Add timestamp
-    parts.append(timestamp)
     
     return "_".join(parts) + suffix
 
