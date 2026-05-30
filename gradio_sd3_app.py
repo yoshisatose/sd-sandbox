@@ -2,15 +2,15 @@ import io
 import os
 import secrets
 import threading
-import uuid
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from queue import Empty, Queue
 
 import gradio as gr
 
 
 ROOT = Path(__file__).resolve().parent
-OUTPUT_ROOT = ROOT / "generated_images" / "gradio_runs"
+OUTPUT_ROOT = ROOT / "generated_images"
 DEFAULT_CUSTOM_OP_PATH = "C:/Program Files/RyzenAI/1.7.1/deployment/onnx_custom_ops.dll"
 
 SUPPORTED_SHAPES = [
@@ -90,6 +90,40 @@ def _load_pipeline_dependencies():
     from src.utils import common
 
     return StableDiffusion3PipelineTrigger, common
+
+
+def _unique_output_path(filename):
+    image_path = OUTPUT_ROOT / filename
+    if not image_path.exists():
+        return image_path
+
+    stem = image_path.stem
+    suffix = image_path.suffix
+    for duplicate_idx in range(1, 1000):
+        candidate = OUTPUT_ROOT / f"{stem}_{duplicate_idx}{suffix}"
+        if not candidate.exists():
+            return candidate
+
+    raise gr.Error(f"Could not find an unused filename for {filename}")
+
+
+def _generation_status_html(current_image, image_count, current_step, total_steps, state):
+    image_count = max(1, image_count)
+    total_steps = max(1, total_steps)
+    current_step = max(0, min(current_step, total_steps))
+    percent = int((current_step / total_steps) * 100)
+    count_text = "Waiting to generate" if current_image <= 0 else f"Image {current_image} of {image_count}"
+
+    return f"""
+<div style="border: 1px solid #ddd; border-radius: 8px; padding: 12px; margin-bottom: 8px;">
+  <div style="display: flex; justify-content: space-between; gap: 12px; margin-bottom: 8px;">
+    <strong>{count_text}</strong>
+    <span>{state}</span>
+  </div>
+  <progress value="{current_step}" max="{total_steps}" style="width: 100%; height: 16px;"></progress>
+  <div style="margin-top: 6px; font-size: 0.9em;">{current_step} / {total_steps} steps ({percent}%)</div>
+</div>
+"""
 
 
 def _release_loaded_model():
@@ -210,7 +244,7 @@ def generate_image(
     guidance_scale,
     seed,
     negative_prompt,
-    num_images_per_prompt,
+    image_count,
     dynamic_shape,
     controlnet,
     model_id,
@@ -226,23 +260,28 @@ def generate_image(
     width = _as_int(width, "Width")
     height = _as_int(height, "Height")
     num_inference_steps = _as_int(num_inference_steps, "Inference steps")
-    num_images_per_prompt = _as_int(num_images_per_prompt, "Images per prompt")
+    image_count = _as_int(image_count, "Image count")
     guidance_scale = _as_float(guidance_scale, "Guidance scale")
+
+    if image_count < 1:
+        raise gr.Error("Image count must be at least 1")
+
+    if num_inference_steps < 1:
+        raise gr.Error("Inference steps must be at least 1")
 
     if dynamic_shape and (width, height) not in SUPPORTED_SHAPES:
         supported = ", ".join(f"{w}x{h}" for w, h in SUPPORTED_SHAPES)
         raise gr.Error(f"Unsupported dynamic shape {width}x{height}. Supported: {supported}")
 
-    run_dir = OUTPUT_ROOT / uuid.uuid4().hex
-    run_dir.mkdir(parents=True, exist_ok=True)
+    OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
 
     seed = _optional_str(seed)
     if seed is None:
-        seed = secrets.randbits(32)
-        seed_line = f"Random seed = {seed}"
+        base_seed = None
+        seed_line = "Random seed per image"
     else:
-        seed = _as_int(seed, "Seed")
-        seed_line = f"Seed = {seed}"
+        base_seed = _as_int(seed, "Seed")
+        seed_line = f"Base seed = {base_seed}"
 
     defaults = PIPELINE_DEFAULTS[pipeline]
     resolved_model_id = pick(_optional_str(model_id), defaults["model_id"])
@@ -251,65 +290,149 @@ def generate_image(
 
     progress(0, desc="Loading models...")
     log_buffer = io.StringIO()
-    log_lines = [f"Pipeline: {pipeline}", f"Model ID: {resolved_model_id}", seed_line, f"Output path: {run_dir}"]
+    log_lines = [
+        f"Pipeline: {pipeline}",
+        f"Model ID: {resolved_model_id}",
+        seed_line,
+        f"Image count: {image_count}",
+        f"Output path: {OUTPUT_ROOT}",
+    ]
+    saved_images = []
+    event_queue = Queue()
 
-    try:
-        with _MODEL_LOCK:
-            pipe_trigger, was_loaded = _get_pipe_trigger(
-                pipeline,
-                width,
-                dynamic_shape,
-                controlnet,
-                model_id,
-                revision,
-                model_path,
-                custom_op_path,
-            )
-            log_lines.extend(
-                [
-                    f"Model cache: {'loaded' if was_loaded else 'reused'}",
-                    f"DD_PLUGINS_ROOT = {os.environ['DD_PLUGINS_ROOT']}",
-                    f"DD_ROOT = {os.environ['DD_ROOT']}",
-                ]
-            )
-            with redirect_stdout(log_buffer), redirect_stderr(log_buffer):
-                images = pipe_trigger.run(
-                    height=height,
-                    width=width,
-                    prompt=prompt,
-                    n_prompt=negative_prompt,
-                    num_inference_steps=num_inference_steps,
-                    control_image_path=None,
-                    controlnet_conditioning_scale=None,
-                    num_images_per_prompt=num_images_per_prompt,
-                    guidance_scale=guidance_scale,
-                    seed=seed,
+    yield (
+        _generation_status_html(0, image_count, 0, num_inference_steps, "Loading models..."),
+        [],
+        "\n".join(log_lines),
+    )
+
+    def worker():
+        try:
+            with _MODEL_LOCK:
+                pipe_trigger, was_loaded = _get_pipe_trigger(
+                    pipeline,
+                    width,
+                    dynamic_shape,
+                    controlnet,
+                    model_id,
+                    revision,
+                    model_path,
+                    custom_op_path,
                 )
-    except Exception as exc:
+                log_lines.extend(
+                    [
+                        f"Model cache: {'loaded' if was_loaded else 'reused'}",
+                        f"DD_PLUGINS_ROOT = {os.environ['DD_PLUGINS_ROOT']}",
+                        f"DD_ROOT = {os.environ['DD_ROOT']}",
+                    ]
+                )
+                event_queue.put(("loaded",))
+                _, common = _load_pipeline_dependencies()
+
+                for requested_image_idx in range(image_count):
+                    current_image = requested_image_idx + 1
+                    image_seed = (
+                        secrets.randbits(32)
+                        if base_seed is None
+                        else (base_seed + requested_image_idx) % (2**32)
+                    )
+                    log_lines.append(f"[Image {current_image}/{image_count}] Seed = {image_seed}")
+                    event_queue.put(("image_start", current_image))
+
+                    def step_callback(_pipe, step_idx, _timestep, _callback_kwargs):
+                        event_queue.put(("step", current_image, min(step_idx + 1, num_inference_steps)))
+                        return {}
+
+                    with redirect_stdout(log_buffer), redirect_stderr(log_buffer):
+                        images = pipe_trigger.run(
+                            height=height,
+                            width=width,
+                            prompt=prompt,
+                            n_prompt=negative_prompt,
+                            num_inference_steps=num_inference_steps,
+                            control_image_path=None,
+                            controlnet_conditioning_scale=None,
+                            num_images_per_prompt=1,
+                            guidance_scale=guidance_scale,
+                            seed=image_seed,
+                            progress_callback=step_callback,
+                        )
+
+                    if not images:
+                        raise gr.Error(f"Image {current_image} finished but no image was returned.")
+
+                    for image in images:
+                        saved_image_idx = len(saved_images)
+                        filename = common.generate_filename(
+                            resolved_model_id,
+                            width,
+                            height,
+                            num_inference_steps,
+                            prompt_idx=0,
+                            image_idx=saved_image_idx,
+                            controlnet=controlnet,
+                            run_mode="batch",
+                            suffix=".png",
+                        )
+
+                        image_path = _unique_output_path(filename)
+                        image.save(image_path)
+                        saved_images.append(str(image_path))
+                        log_lines.append(f"[Image saved] {image_path}")
+
+                    event_queue.put(("image_done", current_image, list(saved_images)))
+        except Exception as exc:
+            event_queue.put(("error", exc))
+        finally:
+            event_queue.put(("done",))
+
+    worker_thread = threading.Thread(target=worker, daemon=True)
+    worker_thread.start()
+
+    current_image = 0
+    current_step = 0
+    state = "Loading models..."
+
+    while True:
+        try:
+            event = event_queue.get(timeout=0.5)
+        except Empty:
+            continue
+
+        event_name = event[0]
+        if event_name == "loaded":
+            state = "Model ready"
+        elif event_name == "image_start":
+            current_image = event[1]
+            current_step = 0
+            state = "Generating..."
+            progress((current_image - 1) / image_count, desc=f"Generating image {current_image}/{image_count}")
+        elif event_name == "step":
+            current_image = event[1]
+            current_step = event[2]
+            state = "Generating..."
+            progress(
+                ((current_image - 1) + (current_step / num_inference_steps)) / image_count,
+                desc=f"Generating image {current_image}/{image_count} ({current_step}/{num_inference_steps})",
+            )
+        elif event_name == "image_done":
+            current_image = event[1]
+            current_step = num_inference_steps
+            state = "Image complete"
+        elif event_name == "error":
+            captured_log = log_buffer.getvalue().strip()
+            log_text = "\n".join(log_lines + ([captured_log] if captured_log else []))
+            raise gr.Error(f"Generation failed. See log output.\n\n{log_text[-4000:]}\n\n{event[1]}") from event[1]
+        elif event_name == "done":
+            break
+
         captured_log = log_buffer.getvalue().strip()
         log_text = "\n".join(log_lines + ([captured_log] if captured_log else []))
-        raise gr.Error(f"Generation failed. See log output.\n\n{log_text[-4000:]}\n\n{exc}") from exc
-
-    progress(1.0, desc="Finalizing image...")
-    _, common = _load_pipeline_dependencies()
-    saved_images = []
-    for image_idx, image in enumerate(images):
-        filename = common.generate_filename(
-            resolved_model_id,
-            width,
-            height,
-            num_inference_steps,
-            prompt_idx=0,
-            image_idx=image_idx,
-            controlnet=controlnet,
-            run_mode="batch",
-            suffix=".png",
+        yield (
+            _generation_status_html(current_image, image_count, current_step, num_inference_steps, state),
+            list(saved_images),
+            log_text,
         )
-
-        image_path = run_dir / filename
-        image.save(image_path)
-        saved_images.append(str(image_path))
-        log_lines.append(f"[Image saved] {image_path}")
 
     captured_log = log_buffer.getvalue().strip()
     if captured_log:
@@ -319,7 +442,12 @@ def generate_image(
     if not saved_images:
         raise gr.Error(f"Generation finished but no image was found.\n\n{log_text[-4000:]}")
 
-    return saved_images[0], saved_images, log_text
+    progress(1.0, desc="Generation complete")
+    yield (
+        _generation_status_html(image_count, image_count, num_inference_steps, num_inference_steps, "Complete"),
+        saved_images,
+        log_text,
+    )
 
 
 def apply_pipeline_defaults(pipeline):
@@ -345,7 +473,7 @@ def update_height_options(selected_width, current_height):
 
 with gr.Blocks(title="Minimal SD3 AMD NPU Generator") as demo:
     gr.Markdown("# Minimal SD3 / SD3.5 Generator")
-    gr.Markdown("Loads the selected model once, reuses it for generation, and displays the generated image.")
+    gr.Markdown("Loads the selected model once, reuses it for generation, and displays the generated images.")
 
     with gr.Row():
         with gr.Column(scale=1):
@@ -367,7 +495,7 @@ with gr.Blocks(title="Minimal SD3 AMD NPU Generator") as demo:
 
             with gr.Row():
                 seed = gr.Textbox(label="Seed (blank = random)", value="")
-                num_images_per_prompt = gr.Number(label="Images per prompt", value=1, precision=0)
+                image_count = gr.Number(label="Image count", value=1, precision=0)
 
             dynamic_shape = gr.Checkbox(label="Dynamic shape", value=True)
             controlnet = gr.Textbox(label="ControlNet", value="None")
@@ -384,8 +512,10 @@ with gr.Blocks(title="Minimal SD3 AMD NPU Generator") as demo:
             generate_button = gr.Button("Generate", variant="primary")
 
         with gr.Column(scale=1):
-            image_output = gr.Image(label="Generated image", type="filepath")
-            gallery_output = gr.Gallery(label="All generated images", columns=2, height="auto")
+            generation_status = gr.HTML(
+                _generation_status_html(0, 1, 0, PIPELINE_DEFAULTS["sd35_base"]["num_inference_steps"], "Idle")
+            )
+            image_output = gr.Gallery(label="Generated images", columns=2, height="auto")
             log_output = gr.Textbox(label="Log", lines=18)
 
     model_inputs = [
@@ -445,7 +575,7 @@ with gr.Blocks(title="Minimal SD3 AMD NPU Generator") as demo:
             guidance_scale,
             seed,
             negative_prompt,
-            num_images_per_prompt,
+            image_count,
             dynamic_shape,
             controlnet,
             model_id,
@@ -453,7 +583,7 @@ with gr.Blocks(title="Minimal SD3 AMD NPU Generator") as demo:
             model_path,
             custom_op_path,
         ],
-        outputs=[image_output, gallery_output, log_output],
+        outputs=[generation_status, image_output, log_output],
     )
 
 

@@ -247,6 +247,7 @@ class StableDiffusion3PipelineTrigger:
         controlnet_conditioning_scale=0.5,
         guidance_scale=3.0,
         seed=None,
+        progress_callback=None,
     ):
         pipe = OnnxStableDiffusion3ControlNetPipelineAMD(
             vae_encoder=self.vae_encoder,
@@ -300,6 +301,8 @@ class StableDiffusion3PipelineTrigger:
                 ),
                 max_sequence_length=self.t5_sequence_len,
                 guidance_scale=guidance_scale,
+                callback_on_step_end=progress_callback,
+                callback_on_step_end_tensor_inputs=[] if progress_callback else ["latents"],
             )
             Logger.debug(f"Current Mem while warm up: {common.measure_mem()}MB")
             execution_time = time.perf_counter() - t_start
@@ -328,6 +331,8 @@ class StableDiffusion3PipelineTrigger:
                     ),
                     max_sequence_length=self.t5_sequence_len,
                     guidance_scale=guidance_scale,
+                    callback_on_step_end=progress_callback,
+                    callback_on_step_end_tensor_inputs=[] if progress_callback else ["latents"],
                 )
                 Logger.debug(f"Current Mem: {common.measure_mem()}MB")
                 # CHANGED: Added progress marker for orchestrator real-time tracking (sd_ref_design integration)
@@ -376,6 +381,8 @@ class StableDiffusion3PipelineTrigger:
                 ),
                 max_sequence_length=self.t5_sequence_len,
                 guidance_scale=guidance_scale,
+                callback_on_step_end=progress_callback,
+                callback_on_step_end_tensor_inputs=[] if progress_callback else ["latents"],
             )
             execution_time = time.perf_counter() - start
             Logger.info(f"Pipeline execution time = {execution_time:.6f}s")
