@@ -251,7 +251,6 @@ def generate_image(
     revision,
     model_path,
     custom_op_path,
-    progress=gr.Progress(track_tqdm=True),
 ):
     prompt = _optional_str(prompt)
     if not prompt:
@@ -288,7 +287,6 @@ def generate_image(
     controlnet = _normalize_controlnet(controlnet)
     negative_prompt = _optional_str(negative_prompt)
 
-    progress(0, desc="Loading models...")
     log_buffer = io.StringIO()
     log_lines = [
         f"Pipeline: {pipeline}",
@@ -406,15 +404,10 @@ def generate_image(
             current_image = event[1]
             current_step = 0
             state = "Generating..."
-            progress((current_image - 1) / image_count, desc=f"Generating image {current_image}/{image_count}")
         elif event_name == "step":
             current_image = event[1]
             current_step = event[2]
             state = "Generating..."
-            progress(
-                ((current_image - 1) + (current_step / num_inference_steps)) / image_count,
-                desc=f"Generating image {current_image}/{image_count} ({current_step}/{num_inference_steps})",
-            )
         elif event_name == "image_done":
             current_image = event[1]
             current_step = num_inference_steps
@@ -442,7 +435,6 @@ def generate_image(
     if not saved_images:
         raise gr.Error(f"Generation finished but no image was found.\n\n{log_text[-4000:]}")
 
-    progress(1.0, desc="Generation complete")
     yield (
         _generation_status_html(image_count, image_count, num_inference_steps, num_inference_steps, "Complete"),
         saved_images,
