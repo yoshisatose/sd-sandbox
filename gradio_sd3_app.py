@@ -1,15 +1,17 @@
-import subprocess
-import sys
+import io
+import os
+import secrets
+import threading
 import uuid
-import re
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 import gradio as gr
 
 
 ROOT = Path(__file__).resolve().parent
-RUNNER = ROOT / "minimal_sd3_run.py"
 OUTPUT_ROOT = ROOT / "generated_images" / "gradio_runs"
+DEFAULT_CUSTOM_OP_PATH = "C:/Program Files/RyzenAI/1.7.1/deployment/onnx_custom_ops.dll"
 
 SUPPORTED_SHAPES = [
     (512, 512),
@@ -30,6 +32,7 @@ SUPPORTED_HEIGHTS_BY_WIDTH = {
 
 PIPELINE_DEFAULTS = {
     "sd3_base": {
+        "model_id": "stabilityai/stable-diffusion-3-medium-amdnpu",
         "num_inference_steps": 30,
         "width": 1024,
         "height": 1024,
@@ -37,6 +40,7 @@ PIPELINE_DEFAULTS = {
         "dynamic_shape": True,
     },
     "sd35_base": {
+        "model_id": "stabilityai/stable-diffusion-3.5-medium-amdnpu",
         "num_inference_steps": 40,
         "width": 1024,
         "height": 1024,
@@ -44,6 +48,14 @@ PIPELINE_DEFAULTS = {
         "dynamic_shape": True,
     },
 }
+
+_LOADED_MODEL_KEY = None
+_LOADED_PIPE_TRIGGER = None
+_MODEL_LOCK = threading.Lock()
+
+
+def pick(value, default):
+    return default if value is None else value
 
 
 def _optional_str(value):
@@ -65,19 +77,128 @@ def _as_float(value, name):
         raise gr.Error(f"{name} must be a number")
 
 
-def _parse_saved_images(output_text: str):
-    images = []
-    marker = "[Image saved]"
-    for line in output_text.splitlines():
-        if marker in line:
-            path_text = line.split(marker, 1)[1].strip()
-            if path_text:
-                image_path = Path(path_text)
-                if not image_path.is_absolute():
-                    image_path = ROOT / image_path
-                if image_path.exists():
-                    images.append(str(image_path))
-    return images
+def _normalize_controlnet(controlnet):
+    return _optional_str(controlnet) or "None"
+
+
+def _custom_op_path(custom_op_path):
+    return _optional_str(custom_op_path) or DEFAULT_CUSTOM_OP_PATH
+
+
+def _load_pipeline_dependencies():
+    from src.StableDiffusion3PipelineTrigger import StableDiffusion3PipelineTrigger
+    from src.utils import common
+
+    return StableDiffusion3PipelineTrigger, common
+
+
+def _release_loaded_model():
+    global _LOADED_MODEL_KEY, _LOADED_PIPE_TRIGGER
+
+    if _LOADED_PIPE_TRIGGER is not None:
+        _LOADED_PIPE_TRIGGER.__exit__(None, None, None)
+    _LOADED_MODEL_KEY = None
+    _LOADED_PIPE_TRIGGER = None
+
+
+def _model_cache_key(pipeline, width, dynamic_shape, controlnet, model_id, revision, model_path, custom_op_path):
+    defaults = PIPELINE_DEFAULTS[pipeline]
+    resolved_model_id = pick(_optional_str(model_id), defaults["model_id"])
+    return (
+        pipeline,
+        resolved_model_id,
+        _optional_str(revision),
+        _optional_str(model_path),
+        _custom_op_path(custom_op_path),
+        _normalize_controlnet(controlnet),
+        bool(dynamic_shape),
+        None if dynamic_shape else _as_int(width, "Width"),
+    )
+
+
+def _get_pipe_trigger(pipeline, width, dynamic_shape, controlnet, model_id, revision, model_path, custom_op_path):
+    global _LOADED_MODEL_KEY, _LOADED_PIPE_TRIGGER
+
+    key = _model_cache_key(
+        pipeline,
+        width,
+        dynamic_shape,
+        controlnet,
+        model_id,
+        revision,
+        model_path,
+        custom_op_path,
+    )
+    if _LOADED_PIPE_TRIGGER is not None and _LOADED_MODEL_KEY == key:
+        return _LOADED_PIPE_TRIGGER, False
+
+    _release_loaded_model()
+
+    defaults = PIPELINE_DEFAULTS[pipeline]
+    project_root = ROOT
+    os.environ["DD_PLUGINS_ROOT"] = str((project_root / "lib" / "transaction" / "stx").resolve())
+    os.environ["DD_ROOT"] = str((project_root / "lib").resolve())
+
+    if not Path(os.environ["DD_PLUGINS_ROOT"]).exists():
+        raise FileNotFoundError(f"DD_PLUGINS_ROOT not found: {os.environ['DD_PLUGINS_ROOT']}")
+
+    if not Path(os.environ["DD_ROOT"]).exists():
+        raise FileNotFoundError(f"DD_ROOT not found: {os.environ['DD_ROOT']}")
+
+    StableDiffusion3PipelineTrigger, _ = _load_pipeline_dependencies()
+    pipe_trigger = StableDiffusion3PipelineTrigger(
+        model_id=pick(_optional_str(model_id), defaults["model_id"]),
+        custom_op_path=_custom_op_path(custom_op_path),
+        root_path=".",
+        model_path=_optional_str(model_path),
+        sub_model_path="normal",
+        common_model_path="common",
+        controlnet_str=_normalize_controlnet(controlnet),
+        enable_compile=False,
+        enable_profile=False,
+        profiling_rounds=1,
+        width=_as_int(width, "Width"),
+        t5_sequence_len=83,
+        is_dynamic=bool(dynamic_shape),
+        revision=_optional_str(revision),
+    )
+    _LOADED_PIPE_TRIGGER = pipe_trigger
+    _LOADED_MODEL_KEY = key
+    return pipe_trigger, True
+
+
+def preload_model(pipeline, width, dynamic_shape, controlnet, model_id, revision, model_path, custom_op_path):
+    try:
+        with _MODEL_LOCK:
+            _, was_loaded = _get_pipe_trigger(
+                pipeline,
+                width,
+                dynamic_shape,
+                controlnet,
+                model_id,
+                revision,
+                model_path,
+                custom_op_path,
+            )
+    except Exception as exc:
+        raise gr.Error(f"Failed to load model: {exc}") from exc
+
+    action = "Loaded" if was_loaded else "Reusing"
+    return f"{action} model for {pipeline}."
+
+
+def preload_default_model():
+    defaults = PIPELINE_DEFAULTS["sd35_base"]
+    return preload_model(
+        "sd35_base",
+        defaults["width"],
+        defaults["dynamic_shape"],
+        "None",
+        "",
+        "",
+        "",
+        DEFAULT_CUSTOM_OP_PATH,
+    )
 
 
 def generate_image(
@@ -115,90 +236,90 @@ def generate_image(
     run_dir = OUTPUT_ROOT / uuid.uuid4().hex
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    cmd = [
-        sys.executable,
-        str(RUNNER),
-        "--pipelines",
-        pipeline,
-        "--prompt",
-        prompt,
-        "--width",
-        str(width),
-        "--height",
-        str(height),
-        "--num_inference_steps",
-        str(num_inference_steps),
-        "--guidance_scale",
-        str(guidance_scale),
-        "--num_images_per_prompt",
-        str(num_images_per_prompt),
-        "--controlnet",
-        _optional_str(controlnet) or "None",
-        "--output_path",
-        str(run_dir),
-    ]
-
-    if dynamic_shape:
-        cmd.append("--dynamic_shape")
-    else:
-        cmd.append("--no-dynamic_shape")
-
     seed = _optional_str(seed)
-    if seed is not None:
-        cmd.extend(["--seed", str(_as_int(seed, "Seed"))])
+    if seed is None:
+        seed = secrets.randbits(32)
+        seed_line = f"Random seed = {seed}"
+    else:
+        seed = _as_int(seed, "Seed")
+        seed_line = f"Seed = {seed}"
 
-    optional_args = {
-        "--n_prompt": negative_prompt,
-        "--model_id": model_id,
-        "--revision": revision,
-        "--model_path": model_path,
-        "--custom_op_path": custom_op_path,
-    }
-    for arg_name, arg_value in optional_args.items():
-        arg_value = _optional_str(arg_value)
-        if arg_value is not None:
-            cmd.extend([arg_name, arg_value])
+    defaults = PIPELINE_DEFAULTS[pipeline]
+    resolved_model_id = pick(_optional_str(model_id), defaults["model_id"])
+    controlnet = _normalize_controlnet(controlnet)
+    negative_prompt = _optional_str(negative_prompt)
+
+    progress(0, desc="Loading models...")
+    log_buffer = io.StringIO()
+    log_lines = [f"Pipeline: {pipeline}", f"Model ID: {resolved_model_id}", seed_line, f"Output path: {run_dir}"]
 
     try:
-        process = subprocess.Popen(
-            cmd,
-            cwd=str(ROOT),
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            bufsize=1,
-            universal_newlines=True,
-        )
+        with _MODEL_LOCK:
+            pipe_trigger, was_loaded = _get_pipe_trigger(
+                pipeline,
+                width,
+                dynamic_shape,
+                controlnet,
+                model_id,
+                revision,
+                model_path,
+                custom_op_path,
+            )
+            log_lines.extend(
+                [
+                    f"Model cache: {'loaded' if was_loaded else 'reused'}",
+                    f"DD_PLUGINS_ROOT = {os.environ['DD_PLUGINS_ROOT']}",
+                    f"DD_ROOT = {os.environ['DD_ROOT']}",
+                ]
+            )
+            with redirect_stdout(log_buffer), redirect_stderr(log_buffer):
+                images = pipe_trigger.run(
+                    height=height,
+                    width=width,
+                    prompt=prompt,
+                    n_prompt=negative_prompt,
+                    num_inference_steps=num_inference_steps,
+                    control_image_path=None,
+                    controlnet_conditioning_scale=None,
+                    num_images_per_prompt=num_images_per_prompt,
+                    guidance_scale=guidance_scale,
+                    seed=seed,
+                )
     except Exception as exc:
-        raise gr.Error(f"Failed to start generation: {exc}") from exc
-
-    log_lines = [f"Command:\n{' '.join(cmd)}\n"]
-    progress(0, desc="Loading models...")
-
-    if process.stdout is not None:
-        for line in process.stdout:
-            log_lines.append(line.rstrip())
-            match = re.search(r"__STEP_COMPLETE__\s+(\d+)/(\d+)", line)
-            if match:
-                current_step = int(match.group(1))
-                total_steps = int(match.group(2))
-                progress(current_step / total_steps, desc=f"Denoising {current_step}/{total_steps}")
-
-    return_code = process.wait()
-    log_text = "\n".join(log_lines)
-
-    if return_code != 0:
-        raise gr.Error(f"Generation failed. See log output.\n\n{log_text[-4000:]}")
+        captured_log = log_buffer.getvalue().strip()
+        log_text = "\n".join(log_lines + ([captured_log] if captured_log else []))
+        raise gr.Error(f"Generation failed. See log output.\n\n{log_text[-4000:]}\n\n{exc}") from exc
 
     progress(1.0, desc="Finalizing image...")
-    images = _parse_saved_images(log_text)
-    if not images:
-        images = [str(path) for path in sorted(run_dir.glob("*.png"), key=lambda p: p.stat().st_mtime)]
+    _, common = _load_pipeline_dependencies()
+    saved_images = []
+    for image_idx, image in enumerate(images):
+        filename = common.generate_filename(
+            resolved_model_id,
+            width,
+            height,
+            num_inference_steps,
+            prompt_idx=0,
+            image_idx=image_idx,
+            controlnet=controlnet,
+            run_mode="batch",
+            suffix=".png",
+        )
 
-    if not images:
+        image_path = run_dir / filename
+        image.save(image_path)
+        saved_images.append(str(image_path))
+        log_lines.append(f"[Image saved] {image_path}")
+
+    captured_log = log_buffer.getvalue().strip()
+    if captured_log:
+        log_lines.append(captured_log)
+    log_text = "\n".join(log_lines)
+
+    if not saved_images:
         raise gr.Error(f"Generation finished but no image was found.\n\n{log_text[-4000:]}")
 
-    return images[0], images, log_text
+    return saved_images[0], saved_images, log_text
 
 
 def apply_pipeline_defaults(pipeline):
@@ -224,7 +345,7 @@ def update_height_options(selected_width, current_height):
 
 with gr.Blocks(title="Minimal SD3 AMD NPU Generator") as demo:
     gr.Markdown("# Minimal SD3 / SD3.5 Generator")
-    gr.Markdown("Runs `minimal_sd3_run.py` and displays the generated image.")
+    gr.Markdown("Loads the selected model once, reuses it for generation, and displays the generated image.")
 
     with gr.Row():
         with gr.Column(scale=1):
@@ -257,7 +378,7 @@ with gr.Blocks(title="Minimal SD3 AMD NPU Generator") as demo:
                 model_path = gr.Textbox(label="Model path", value="")
                 custom_op_path = gr.Textbox(
                     label="Custom op path",
-                    value="C:/Program Files/RyzenAI/1.7.1/deployment/onnx_custom_ops.dll",
+                    value=DEFAULT_CUSTOM_OP_PATH,
                 )
 
             generate_button = gr.Button("Generate", variant="primary")
@@ -267,17 +388,51 @@ with gr.Blocks(title="Minimal SD3 AMD NPU Generator") as demo:
             gallery_output = gr.Gallery(label="All generated images", columns=2, height="auto")
             log_output = gr.Textbox(label="Log", lines=18)
 
-    pipeline.change(
+    model_inputs = [
+        pipeline,
+        width,
+        dynamic_shape,
+        controlnet,
+        model_id,
+        revision,
+        model_path,
+        custom_op_path,
+    ]
+
+    demo.load(
+        preload_model,
+        inputs=model_inputs,
+        outputs=log_output,
+    )
+
+    pipeline_change = pipeline.change(
         apply_pipeline_defaults,
         inputs=pipeline,
         outputs=[width, height, num_inference_steps, guidance_scale, dynamic_shape],
     )
+    pipeline_change.then(
+        preload_model,
+        inputs=model_inputs,
+        outputs=log_output,
+    )
 
-    width.change(
+    width_change = width.change(
         update_height_options,
         inputs=[width, height],
         outputs=height,
     )
+    width_change.then(
+        preload_model,
+        inputs=model_inputs,
+        outputs=log_output,
+    )
+
+    for model_input in [dynamic_shape, controlnet, model_id, revision, model_path, custom_op_path]:
+        model_input.change(
+            preload_model,
+            inputs=model_inputs,
+            outputs=log_output,
+        )
 
     generate_button.click(
         generate_image,
@@ -303,4 +458,5 @@ with gr.Blocks(title="Minimal SD3 AMD NPU Generator") as demo:
 
 
 if __name__ == "__main__":
+    print(preload_default_model(), flush=True)
     demo.launch()
