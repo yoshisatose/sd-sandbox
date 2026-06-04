@@ -225,3 +225,4 @@ lib/*
 *.pyc 
 test/generated_images/*
 generated_images/*
+samples/*
